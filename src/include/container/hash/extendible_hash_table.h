@@ -105,6 +105,11 @@ class ExtendibleHashTable : public HashTable<K, V> {
    */
   auto Remove(const K &key) -> bool override;
 
+  /*
+    resize bucket because depath higher or bucketsize full
+  */
+
+  void ReSize(size_t size);
   /**
    * Bucket class for each hash table bucket that the directory points to.
    */

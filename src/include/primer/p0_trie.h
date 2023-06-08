@@ -12,11 +12,13 @@
 
 #pragma once
 
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -137,7 +139,7 @@ class TrieNode {
       return nullptr;
     }
     children_.emplace(key_char, std::move(child));
-  
+
     return &children_[key_char];
   }
 
@@ -267,6 +269,17 @@ class TrieNodeWithValue : public TrieNode {
  * value can be any type.
  */
 class Trie {
+  struct WLOCKRAII {
+    explicit WLOCKRAII(ReaderWriterLatch *lat) : latch_(lat) { latch_->WLock(); }
+    ~WLOCKRAII() { latch_->WUnlock(); }
+    ReaderWriterLatch *latch_;
+  };
+  struct RLOCKRAII {
+    explicit RLOCKRAII(ReaderWriterLatch *lat) : latch_(lat) { latch_->RLock(); }
+    ~RLOCKRAII() { latch_->RUnlock(); }
+    ReaderWriterLatch *latch_;
+  };
+
  private:
   /* Root node of the trie */
   std::unique_ptr<TrieNode> root_;
@@ -316,42 +329,35 @@ class Trie {
    */
   template <typename T>
   bool Insert(const std::string &key, T value) {
-    latch_.WLock();
-    do {
-      if (key.empty()) {
-        break;
-      }
-      auto pointer = &root_;
-      size_t i = 0;
-      for (; i < key.size() && pointer->get()->HasChild(key[i]); i++) {
-        if (i != key.size() - 1) {
-          pointer = pointer->get()->GetChildNode(key[i]);
-        } else if (!pointer->get()->GetChildNode(key[i])->get()->IsEndNode()) {
-          std::unique_ptr<TrieNode> childpointer(pointer->get()->GetChildNode(key[i])->release());
-          pointer->get()->RemoveChildNode(key[i]);
+    WLOCKRAII wlock(&latch_);
+    if (key.empty()) {
+      return false;
+    }
+    auto pointer = &root_;
+    size_t i = 0;
+    for (; i < key.size() && pointer->get()->HasChild(key[i]); i++) {
+      if (i != key.size() - 1) {
+        pointer = pointer->get()->GetChildNode(key[i]);
+      } else if (!pointer->get()->GetChildNode(key[i])->get()->IsEndNode()) {
+        std::unique_ptr<TrieNode> childpointer(pointer->get()->GetChildNode(key[i])->release());
+        pointer->get()->RemoveChildNode(key[i]);
 
-          auto p = new TrieNodeWithValue<T>(std::move(*(childpointer.release())), value);
-          std::unique_ptr<TrieNode> new_node(dynamic_cast<TrieNode *>(p));
+        auto p = new TrieNodeWithValue<T>(std::move(*(childpointer.release())), value);
+        std::unique_ptr<TrieNode> new_node(dynamic_cast<TrieNode *>(p));
 
-          pointer->get()->InsertChildNode(key[i], std::move(new_node));
-        }
+        pointer->get()->InsertChildNode(key[i], std::move(new_node));
+        return true;
       }
-      if (i == key.size()) {
-        break;
-      }
-      for (; i < key.size() - 1; i++) {
-        pointer = pointer->get()->InsertChildNode(key[i], std::make_unique<TrieNode>(key[i]));
-      }
-      std::unique_ptr<TrieNodeWithValue<T> > endnode = std::make_unique<TrieNodeWithValue<T> >(key.back(), value);
-      pointer->get()->InsertChildNode(key.back(),
-                                      std::unique_ptr<TrieNode>(dynamic_cast<TrieNode *>(endnode.release())));
-      latch_.WUnlock();
-      return true;
-
-    } while (false);
-
-    latch_.WUnlock();
-    return false;
+    }
+    if (i == key.size()) {
+      return false;
+    }
+    for (; i < key.size() - 1; i++) {
+      pointer = pointer->get()->InsertChildNode(key[i], std::make_unique<TrieNode>(key[i]));
+    }
+    std::unique_ptr<TrieNodeWithValue<T> > endnode = std::make_unique<TrieNodeWithValue<T> >(key.back(), value);
+    pointer->get()->InsertChildNode(key.back(), std::unique_ptr<TrieNode>(dynamic_cast<TrieNode *>(endnode.release())));
+    return true;
   }
 
   /**
@@ -373,17 +379,16 @@ class Trie {
    * @return True if key exists and is removed, false otherwise
    */
   bool Remove(const std::string &key) {
-    if (key.empty()) {
+    if (key.empty()) {  // If key is empty
       return false;
     }
     bool hvchild = {};
-    latch_.WLock();
+    WLOCKRAII wlock(&latch_);
     bool res = Remove(&root_, key, &hvchild);
-    latch_.WUnlock();
     return res;
   }
   bool Remove(std::unique_ptr<TrieNode> *child, std::string key, bool *hvchild) {
-    if (key.size() == 1) {
+    if (key.size() == 1) {  //  reach end node
       if (child->get()->HasChild(key[0])) {
         auto pc = child->get()->GetChildNode(key[0]);
         // child node have child child node  so don`t remove
@@ -398,10 +403,9 @@ class Trie {
       return false;
     }
     std::unique_ptr<TrieNode> *pc = child->get()->GetChildNode(key[0]);
-    if (*pc == nullptr) {
+    if (*pc == nullptr) {  // If key  not found, return false.
       return false;
     }
-
     bool res = Remove(pc, key.substr(1), hvchild);
     if (res) {
       if (!*hvchild) {
@@ -410,7 +414,6 @@ class Trie {
       }
       return true;
     }
-
     return false;
   }
   /**
@@ -434,29 +437,28 @@ class Trie {
    */
   template <typename T>
   T GetValue(const std::string &key, bool *success) {
-    latch_.RLock();
-    do {
-      *success = false;
-      if (key.empty()) {
-        break;
-      }
-      auto p = &root_;
-      size_t i = 0;
-      while (i < key.size() && (p = p->get()->GetChildNode(key[i]))) {
-        i++;
-      }
-      if (i != key.size() || p == nullptr) {
-        break;
-      }
-      *success = true;
-      auto tp = dynamic_cast<TrieNodeWithValue<T> *>(p->get());
-      latch_.RUnlock();
-      return tp->GetValue();
-
-    } while (false);
-    
-    latch_.RUnlock();
-    return {};
+    RLOCKRAII rlock(&latch_);
+    *success = false;
+    if (key.empty()) {  // If key is empty, set success to false.
+      return {};
+    }
+    auto p = &root_;
+    size_t i = 0;
+    while (i < key.size() && (p = p->get()->GetChildNode(key[i]))) {
+      i++;
+    }
+    if (i != key.size() || p == nullptr) {  // If key does not exist in trie, set success to false.
+      return {};
+    }
+    if (!p->get()->IsEndNode()) {  // If given type T is not the same as the value type stored in
+      return {};
+    }
+    auto tp = dynamic_cast<TrieNodeWithValue<T> *>(p->get());
+    if (tp == nullptr) {
+      return {};  // If the casted result is not nullptr, then type T is the correct type.
+    }
+    *success = true;
+    return tp->GetValue();
   }
 };
 }  // namespace bustub
